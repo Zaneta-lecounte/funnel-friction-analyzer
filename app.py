@@ -13,12 +13,17 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from funnel import (
+    BLENDED,
     LEAKAGE_METRICS,
     clean_funnel,
     compute_metrics,
     largest_leakage,
+    segment_comparison,
+    segment_divergence,
+    segment_insights,
     transition_table,
     validate_funnel,
+    validate_segments,
 )
 from opportunity_model import (
     DEFAULT_EFFORT,
@@ -31,6 +36,7 @@ from opportunity_model import (
 
 ROOT = Path(__file__).parent
 SAMPLE_FUNNEL = ROOT / "sample_funnel.csv"
+SAMPLE_SEGMENTS = ROOT / "sample_segments.csv"
 
 # Synthetic default effort (1 = easy, 5 = hard) for the sample funnel's transitions.
 SAMPLE_EFFORT = {
@@ -43,6 +49,10 @@ SAMPLE_EFFORT = {
 
 BAR_COLOR = "#2a78d6"
 LEAK_COLOR = "#d03b3b"
+# Categorical series colours, assigned in this fixed order (never cycled).
+SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
+                 "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
+BLENDED_COLOR = "#898781"
 
 st.set_page_config(page_title="Funnel Friction Analyzer", page_icon="🔻", layout="wide")
 
@@ -68,6 +78,29 @@ def funnel_chart(metrics: pd.DataFrame, leak_to_index: int) -> go.Figure:
                        "Cumulative: %{percentInitial:.2%}<extra></extra>"),
     ))
     fig.update_layout(margin={"l": 10, "r": 10, "t": 10, "b": 10}, height=420)
+    return fig
+
+
+def segment_chart(comp: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    transitions = comp["transition"].drop_duplicates().tolist()
+    segments = [x for x in comp["segment"].drop_duplicates() if x != BLENDED] + [BLENDED]
+    # Horizontal groups draw bottom-up, so add traces in reverse to read top-down.
+    for i, name in reversed(list(enumerate(segments))):
+        part = comp[comp["segment"] == name]
+        fig.add_trace(go.Bar(
+            name=name, y=part["transition"], x=part["rate"], orientation="h",
+            marker={"color": BLENDED_COLOR if name == BLENDED else SERIES_COLORS[i]},
+            text=part["rate"].map(lambda v: f"{v:.1%}"), textposition="outside",
+            hovertemplate=f"<b>{name}</b><br>%{{y}}<br>Step conversion: %{{x:.1%}}<extra></extra>",
+        ))
+    fig.update_layout(
+        barmode="group", bargap=0.25, bargroupgap=0.08, height=120 + 70 * len(transitions),
+        xaxis={"tickformat": ".0%", "title": "Step conversion"},
+        yaxis={"categoryorder": "array", "categoryarray": transitions[::-1]},
+        legend={"orientation": "h", "y": 1.08, "x": 0, "traceorder": "reversed"},
+        margin={"l": 10, "r": 10, "t": 30, "b": 10},
+    )
     return fig
 
 
@@ -162,7 +195,7 @@ k4.metric("Largest leak · drop-off", pct(leak["drop_off"]),
           help=f"Leakage defined by: {LEAKAGE_METRICS[leak_by].lower()}")
 k4.caption(f"{leak['transition']} · {leak['users_lost']:,.0f} users lost")
 
-tab_diag, tab_prio = st.tabs(["① Diagnose", "② Prioritize"])
+tab_diag, tab_prio, tab_seg = st.tabs(["① Diagnose", "② Prioritize", "③ Segments"])
 
 # ------------------------------------------------------------------ diagnose
 
@@ -235,3 +268,50 @@ with tab_prio:
     st.subheader("Summary")
     for line in build_summary(funnel_df, opps, customer_value, leak["transition"]):
         st.markdown(f"- {md_safe(line)}")
+
+# ------------------------------------------------------------------ segments
+
+with tab_seg:
+    st.subheader("Segment comparison")
+    st.caption("Long-format CSV with columns `segment, stage, users` — every segment lists the "
+               "same stages in the same order (e.g. paid vs organic).")
+    seg_source = st.radio("Segment data", ["Sample segments", "Upload CSV"], horizontal=True,
+                          key="seg-source")
+    seg_raw = pd.read_csv(SAMPLE_SEGMENTS)
+    if seg_source == "Upload CSV":
+        seg_upload = st.file_uploader("Segment CSV", type="csv", key="seg-upload")
+        seg_raw = read_csv(seg_upload) if seg_upload is not None else None
+
+    if seg_raw is None:
+        st.info("Upload a segment CSV to compare funnels.")
+    else:
+        seg_validation = validate_segments(seg_raw)
+        if not seg_validation.ok:
+            st.error("**The segment data has problems:**")
+            for msg in seg_validation.errors:
+                st.markdown(f"- {md_safe(msg)}")
+        else:
+            for msg in seg_validation.warnings:
+                st.warning(msg)
+            comp = segment_comparison(seg_raw)
+            st.plotly_chart(segment_chart(comp), width="stretch", theme="streamlit")
+
+            st.markdown("**Where segments leak differently**")
+            for line in segment_insights(seg_raw, leak_by):
+                st.markdown(f"- {md_safe(line)}")
+
+            div = segment_divergence(seg_raw)
+            rate_cols = [c for c in div.columns if c.startswith("rate · ")]
+            st.dataframe(
+                div.assign(**{c: div[c].map(pct) for c in rate_cols},
+                           spread_pp=div["spread_pp"].round(1)),
+                hide_index=True, width="stretch",
+                column_config={"transition": "Transition", "best_segment": "Best",
+                               "worst_segment": "Worst", "spread_pp": "Spread (pp)"},
+            )
+            with st.expander("Full per-segment metrics"):
+                st.dataframe(
+                    comp.assign(rate=comp["rate"].map(pct), drop_off=comp["drop_off"].map(pct),
+                                rate_vs_blended_pp=comp["rate_vs_blended_pp"].round(1)),
+                    hide_index=True, width="stretch",
+                )

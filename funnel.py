@@ -185,3 +185,127 @@ def largest_leakage(df: pd.DataFrame, by: str = "drop_off") -> int:
         raise ValueError(f"by must be one of {list(LEAKAGE_METRICS)}, got {by!r}")
     t = transition_table(df)
     return int(t[by].idxmax())
+
+
+# ---------------------------------------------------------------- segments
+
+SEGMENT_COLUMN = "segment"
+BLENDED = "All segments"
+
+
+def split_segments(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Split a long ``segment, stage, users`` table into one funnel per segment.
+
+    Segments and stages keep their order of first appearance.
+    """
+    df = clean_funnel(df)
+    df[SEGMENT_COLUMN] = df[SEGMENT_COLUMN].astype("string").str.strip()
+    return {
+        str(seg): grp[["stage", "users"]].reset_index(drop=True)
+        for seg, grp in df.groupby(SEGMENT_COLUMN, sort=False)
+    }
+
+
+def validate_segments(df: pd.DataFrame) -> ValidationResult:
+    """Validate a segmented funnel: segment column present, same stages in the same
+    order for every segment, and every segment funnel valid on its own."""
+    cleaned = clean_funnel(df)
+    if SEGMENT_COLUMN not in cleaned.columns:
+        return ValidationResult(errors=[
+            "Missing required column: segment. Expected columns `segment, stage, users`."])
+    missing = [c for c in REQUIRED_COLUMNS if c not in cleaned.columns]
+    if missing:
+        return ValidationResult(errors=[
+            f"Missing required column(s): {', '.join(missing)}. "
+            "Expected columns `segment, stage, users`."])
+    if cleaned[SEGMENT_COLUMN].isna().any():
+        return ValidationResult(errors=["Some rows have a blank segment."])
+
+    segments = split_segments(df)
+    errors: list[str] = []
+    warnings: list[str] = []
+    if len(segments) < 2:
+        errors.append("Segment comparison needs at least 2 segments.")
+
+    reference_name, reference = next(iter(segments.items()))
+    ref_stages = reference["stage"].tolist()
+    for name, seg in segments.items():
+        if seg["stage"].tolist() != ref_stages:
+            errors.append(
+                f"Segment '{name}' has stages {seg['stage'].tolist()} but '{reference_name}' "
+                f"has {ref_stages}. Every segment must list the same stages in the same order "
+                "so transitions can be compared."
+            )
+            continue
+        result = validate_funnel(seg)
+        errors += [f"[{name}] {e}" for e in result.errors]
+        warnings += [f"[{name}] {w}" for w in result.warnings]
+    return ValidationResult(errors=errors, warnings=warnings)
+
+
+def blended_funnel(df: pd.DataFrame) -> pd.DataFrame:
+    """Sum users per stage across segments (stage order preserved)."""
+    segments = split_segments(df)
+    stages = next(iter(segments.values()))["stage"].tolist()
+    totals = sum(seg["users"].to_numpy() for seg in segments.values())
+    return pd.DataFrame({"stage": stages, "users": totals})
+
+
+def segment_comparison(df: pd.DataFrame) -> pd.DataFrame:
+    """Long table of transition metrics per segment, plus the blended funnel.
+
+    Columns: segment, transition, from_stage, to_stage, from_users, to_users, rate,
+    drop_off, users_lost, rate_vs_blended_pp (segment rate minus blended rate).
+    """
+    blended = transition_table(blended_funnel(df))
+    frames = []
+    for name, seg in [*split_segments(df).items(), (BLENDED, blended_funnel(df))]:
+        t = transition_table(seg)
+        t.insert(0, "segment", name)
+        t["rate_vs_blended_pp"] = (t["rate"] - blended["rate"]) * 100
+        frames.append(t)
+    return pd.concat(frames, ignore_index=True)
+
+
+def segment_divergence(df: pd.DataFrame) -> pd.DataFrame:
+    """Per transition: each segment's rate, the spread between best and worst
+    segment (percentage points) and which segments those are. Sorted by spread desc."""
+    comp = segment_comparison(df)
+    comp = comp[comp["segment"] != BLENDED]
+    wide = comp.pivot(index="transition", columns="segment", values="rate")
+    order = comp["transition"].drop_duplicates().tolist()
+    seg_order = comp["segment"].drop_duplicates().tolist()
+    wide = wide.loc[order, seg_order]
+
+    out = wide.copy()
+    out.columns = [f"rate · {c}" for c in out.columns]
+    out["best_segment"] = wide.idxmax(axis=1)
+    out["worst_segment"] = wide.idxmin(axis=1)
+    out["spread_pp"] = (wide.max(axis=1) - wide.min(axis=1)) * 100
+    out = out.reset_index()
+    out["funnel_order"] = range(len(out))
+    return (out.sort_values(["spread_pp", "funnel_order"], ascending=[False, True])
+               .drop(columns="funnel_order").reset_index(drop=True))
+
+
+def segment_insights(df: pd.DataFrame, by: str = "drop_off") -> list[str]:
+    """Plain-English notes on where each segment leaks and where segments differ most."""
+    lines = []
+    div = segment_divergence(df)
+    top = div.iloc[0]
+    best, worst = top["best_segment"], top["worst_segment"]
+    lines.append(
+        f"Segments diverge most at {top['transition']}: {best} converts "
+        f"{top[f'rate · {best}']:.1%} vs {worst} at {top[f'rate · {worst}']:.1%} "
+        f"({top['spread_pp']:.1f} pp gap). Fixing {worst}'s experience here is the "
+        "segment-specific opportunity."
+    )
+    for name, seg in split_segments(df).items():
+        t = transition_table(seg)
+        i = largest_leakage(seg, by)
+        overall = seg["users"].iloc[-1] / seg["users"].iloc[0]
+        lines.append(
+            f"{name} leaks most at {t.at[i, 'transition']} ({t.at[i, 'drop_off']:.1%} drop-off, "
+            f"{t.at[i, 'users_lost']:,.0f} users lost); end-to-end conversion {overall:.2%}."
+        )
+    return lines

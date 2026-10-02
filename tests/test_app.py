@@ -14,3 +14,10 @@ def test_app_renders_sample_funnel():
     summary = " ".join(m.value for m in at.markdown).replace("\\", "")
     assert "A 10% lift at Landing Page → Form Start yields ~250 more form starts" in summary
     assert "Highest priority given effort." in summary
+
+
+def test_app_renders_segment_tab():
+    at = AppTest.from_file(APP, default_timeout=30).run()
+    assert not at.exception
+    text = " ".join(m.value for m in at.markdown).replace("\\", "")
+    assert "Segments diverge most at Form Complete → Qualified Lead" in text
