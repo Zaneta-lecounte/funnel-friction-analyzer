@@ -24,7 +24,7 @@ from collections.abc import Sequence
 
 import pandas as pd
 
-from funnel import clean_funnel, step_rates, transition_label
+from funnel import benchmark_gap, clean_funnel, step_rates, transition_label
 
 DEFAULT_LIFT = 0.10
 DEFAULT_EFFORT = 3
@@ -216,3 +216,47 @@ def build_summary(df: pd.DataFrame, opps: pd.DataFrame, customer_value: float,
     for _, row in ranked(opps).iterrows():
         lines.append(describe_opportunity(row, stages[-1], customer_value, len(opps)))
     return lines
+
+
+# ---------------------------------------------------------------- benchmarks
+
+def benchmark_opportunity(df: pd.DataFrame, targets: Sequence[float | None],
+                          customer_value: float = 0.0) -> pd.DataFrame:
+    """Benchmark gaps plus the final-stage upside of closing each gap on its own.
+
+    Adds to ``funnel.benchmark_gap``: incremental_final (extra final-stage users if only
+    this step reached its target, re-propagated through actual downstream rates) and
+    incremental_revenue. Steps at/above target or without a target contribute 0.
+    """
+    gap = benchmark_gap(df, list(targets))
+    df = clean_funnel(df)
+    users = df["users"].astype(float).tolist()
+    rates = step_rates(users)
+    baseline_final = propagate(users[0], rates)[-1]
+
+    inc = []
+    for k, row in gap.iterrows():
+        if row["status"] != "Below":
+            inc.append(0.0)
+            continue
+        new_rates = list(rates)
+        new_rates[k] = row["target_rate"]
+        inc.append(propagate(users[0], new_rates)[-1] - baseline_final)
+    gap["incremental_final"] = inc
+    gap["incremental_revenue"] = gap["incremental_final"] * customer_value
+    return gap
+
+
+def benchmark_total_upside(df: pd.DataFrame, targets: Sequence[float | None]) -> float:
+    """Extra final-stage users if *every* below-target step reached its target at once.
+
+    Compounds, so it exceeds the sum of single-step upsides.
+    """
+    df = clean_funnel(df)
+    users = df["users"].astype(float).tolist()
+    rates = step_rates(users)
+    lifted = [
+        max(r, float(t)) if t is not None and not pd.isna(t) else r
+        for r, t in zip(rates, targets)
+    ]
+    return propagate(users[0], lifted)[-1] - propagate(users[0], rates)[-1]

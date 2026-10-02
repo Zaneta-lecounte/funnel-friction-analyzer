@@ -29,7 +29,11 @@ from opportunity_model import (
     DEFAULT_EFFORT,
     EFFORT_MAX,
     EFFORT_MIN,
+    benchmark_opportunity,
+    benchmark_total_upside,
     build_summary,
+    money,
+    pluralize,
     ranked,
     size_opportunities,
 )
@@ -45,6 +49,15 @@ SAMPLE_EFFORT = {
     "Form Complete → Qualified Lead": 3,
     "Qualified Lead → Opportunity": 3,
     "Opportunity → Customer": 4,
+}
+
+# Illustrative (synthetic) target step-conversion rates for the sample funnel.
+SAMPLE_BENCHMARKS = {
+    "Landing Page → Form Start": 0.30,
+    "Form Start → Form Complete": 0.65,
+    "Form Complete → Qualified Lead": 0.40,
+    "Qualified Lead → Opportunity": 0.35,
+    "Opportunity → Customer": 0.25,
 }
 
 BAR_COLOR = "#2a78d6"
@@ -99,6 +112,32 @@ def segment_chart(comp: pd.DataFrame) -> go.Figure:
         xaxis={"tickformat": ".0%", "title": "Step conversion"},
         yaxis={"categoryorder": "array", "categoryarray": transitions[::-1]},
         legend={"orientation": "h", "y": 1.08, "x": 0, "traceorder": "reversed"},
+        margin={"l": 10, "r": 10, "t": 30, "b": 10},
+    )
+    return fig
+
+
+def benchmark_chart(bench: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        name="Actual (red = below target)", y=bench["transition"], x=bench["actual_rate"], orientation="h",
+        marker={"color": [LEAK_COLOR if s == "Below" else BAR_COLOR for s in bench["status"]]},
+        text=[f"{a:.1%}" + (" ▼ below" if s == "Below" else "")
+              for a, s in zip(bench["actual_rate"], bench["status"])],
+        textposition="inside", insidetextanchor="start", textfont={"color": "#ffffff"},
+        hovertemplate="<b>%{y}</b><br>Actual: %{x:.1%}<extra></extra>",
+    ))
+    has_target = bench["target_rate"].notna()
+    fig.add_trace(go.Scatter(
+        name="Target", y=bench.loc[has_target, "transition"],
+        x=bench.loc[has_target, "target_rate"], mode="markers",
+        marker={"symbol": "line-ns", "size": 26, "line": {"width": 3, "color": "#52514e"}},
+        hovertemplate="<b>%{y}</b><br>Target: %{x:.1%}<extra></extra>",
+    ))
+    fig.update_layout(
+        height=100 + 55 * len(bench), xaxis={"tickformat": ".0%", "title": "Step conversion"},
+        yaxis={"categoryorder": "array", "categoryarray": bench["transition"].tolist()[::-1]},
+        legend={"orientation": "h", "y": 1.1, "x": 0},
         margin={"l": 10, "r": 10, "t": 30, "b": 10},
     )
     return fig
@@ -195,7 +234,8 @@ k4.metric("Largest leak · drop-off", pct(leak["drop_off"]),
           help=f"Leakage defined by: {LEAKAGE_METRICS[leak_by].lower()}")
 k4.caption(f"{leak['transition']} · {leak['users_lost']:,.0f} users lost")
 
-tab_diag, tab_prio, tab_seg = st.tabs(["① Diagnose", "② Prioritize", "③ Segments"])
+tab_diag, tab_prio, tab_seg, tab_bench = st.tabs(
+    ["① Diagnose", "② Prioritize", "③ Segments", "④ Benchmark"])
 
 # ------------------------------------------------------------------ diagnose
 
@@ -315,3 +355,61 @@ with tab_seg:
                                 rate_vs_blended_pp=comp["rate_vs_blended_pp"].round(1)),
                     hide_index=True, width="stretch",
                 )
+
+# ------------------------------------------------------------------ benchmark
+
+with tab_bench:
+    st.subheader("Gap to benchmark")
+    st.caption("Enter a target step-conversion rate per transition (leave blank for none). "
+               "Sample targets are illustrative, not industry data.")
+    targets_in = pd.DataFrame({
+        "transition": transitions["transition"],
+        "actual": transitions["rate"].map(pct),
+        "target %": [SAMPLE_BENCHMARKS[t] * 100 if t in SAMPLE_BENCHMARKS else None
+                     for t in transitions["transition"]],
+    })
+    targets_in["target %"] = targets_in["target %"].astype(float)
+    targets_in = st.data_editor(
+        targets_in, key=f"targets-{hash(tuple(transitions['transition']))}",
+        hide_index=True, width="stretch", disabled=["transition", "actual"],
+        column_config={"target %": st.column_config.NumberColumn(
+            min_value=0.0, max_value=100.0, step=0.5, format="%.1f%%")},
+    )
+    targets = [None if pd.isna(v) else v / 100 for v in targets_in["target %"]]
+
+    bench = benchmark_opportunity(funnel_df, targets, customer_value)
+    total = benchmark_total_upside(funnel_df, targets)
+    final_stage = metrics["stage"].iloc[-1]
+    below = bench[bench["status"] == "Below"]
+
+    b1, b2, b3 = st.columns(3)
+    b1.metric("Steps below target", f"{len(below)} of {int((bench['status'] != 'No target').sum())}")
+    b2.metric(f"+ {pluralize(final_stage)} if all targets hit", f"{total:,.1f}")
+    b3.metric("Revenue upside (all targets)", money(total * customer_value))
+
+    st.plotly_chart(benchmark_chart(bench), width="stretch", theme="streamlit")
+    st.dataframe(
+        pd.DataFrame({
+            "Transition": bench["transition"],
+            "Actual": bench["actual_rate"].map(pct),
+            "Target": bench["target_rate"].map(pct),
+            "Gap (pp)": bench["gap_pp"].round(1),
+            "Status": bench["status"],
+            "Users short at next stage": bench["users_gap"].clip(lower=0).round(0),
+            f"+ {final_stage} if this step hits target": bench["incremental_final"].round(2),
+            "+ Revenue ($)": bench["incremental_revenue"].round(0),
+        }),
+        hide_index=True, width="stretch",
+        column_config={"+ Revenue ($)": st.column_config.NumberColumn(format="dollar")},
+    )
+    if len(below):
+        worst = below.sort_values("incremental_final", ascending=False).iloc[0]
+        st.markdown(md_safe(
+            f"**Biggest benchmark gap by impact:** {worst['transition']} runs "
+            f"{abs(worst['gap_pp']):.1f} pp below target; closing it alone adds "
+            f"~{worst['incremental_final']:,.1f} {pluralize(final_stage)} "
+            f"(~{money(worst['incremental_revenue'])}). Closing every gap compounds to "
+            f"~{total:,.1f}."
+        ))
+    else:
+        st.success("Every transition with a target is at or above it.")

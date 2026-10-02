@@ -21,3 +21,10 @@ def test_app_renders_segment_tab():
     assert not at.exception
     text = " ".join(m.value for m in at.markdown).replace("\\", "")
     assert "Segments diverge most at Form Complete → Qualified Lead" in text
+
+
+def test_app_renders_benchmark_tab():
+    at = AppTest.from_file(APP, default_timeout=30).run()
+    assert not at.exception
+    text = " ".join(m.value for m in at.markdown).replace("\\", "")
+    assert "Biggest benchmark gap by impact:" in text

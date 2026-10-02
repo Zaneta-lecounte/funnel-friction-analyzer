@@ -309,3 +309,35 @@ def segment_insights(df: pd.DataFrame, by: str = "drop_off") -> list[str]:
             f"{t.at[i, 'users_lost']:,.0f} users lost); end-to-end conversion {overall:.2%}."
         )
     return lines
+
+
+# ---------------------------------------------------------------- benchmarks
+
+def benchmark_gap(df: pd.DataFrame, targets: list[float | None]) -> pd.DataFrame:
+    """Compare each transition's actual rate with a target rate.
+
+    ``targets`` has one entry per transition (fraction, or None/NaN for "no target").
+    Columns: transition, actual_rate, target_rate, gap_pp (actual - target, in
+    percentage points), status ("Below", "At/above", "No target") and users_gap —
+    users the next stage is short of target given the actual users entering the step
+    (negative means ahead of target).
+    """
+    t = transition_table(df)
+    if len(targets) != len(t):
+        raise ValueError(f"targets needs {len(t)} values (one per transition), got {len(targets)}")
+    target = pd.Series([float("nan") if v is None else float(v) for v in targets], dtype=float)
+    if ((target < 0) | (target > 1)).any():
+        raise ValueError("target rates must be between 0 and 1")
+
+    out = pd.DataFrame({
+        "transition": t["transition"],
+        "actual_rate": t["rate"],
+        "target_rate": target,
+        "gap_pp": (t["rate"] - target) * 100,
+        "users_gap": t["from_users"] * target - t["to_users"],
+    })
+    out["status"] = [
+        "No target" if pd.isna(tr) else ("Below" if ar < tr - 1e-12 else "At/above")
+        for ar, tr in zip(out["actual_rate"], out["target_rate"])
+    ]
+    return out
